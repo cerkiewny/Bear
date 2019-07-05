@@ -21,12 +21,20 @@ use std::fs;
 use std::path;
 use tempfile;
 
-use crate::intercept::event::Event;
+use crate::intercept::event::{Event, ProcessId};
 use crate::intercept::{Result, EventEnvelope};
 
 
 pub mod sender {
     use super::*;
+
+    #[cfg(test)]
+    use mockiato::mockable;
+
+    #[cfg_attr(test, mockable)]
+    pub trait EventSink {
+        fn report(&self, id: ProcessId, event: Event);
+    }
 
     pub struct Protocol {
         path: path::PathBuf,
@@ -37,11 +45,18 @@ pub mod sender {
             Ok(Protocol { path: path.to_path_buf() })
         }
 
-        pub fn send(&mut self, event: EventEnvelope) {
+        pub fn send(&self, event: EventEnvelope) {
             debug!("Event to save: {:?}", &event);
             let name = save(&self.path, &event)
                 .expect("Persist event on filesystem failed.");
             debug!("Event saved into file: {:?}", name);
+        }
+    }
+
+    impl EventSink for Protocol {
+        fn report(&self, id: u32, event: Event) {
+            let envelope = EventEnvelope::new(id, event);
+            self.send(envelope);
         }
     }
 }

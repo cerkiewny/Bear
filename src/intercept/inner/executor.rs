@@ -17,15 +17,13 @@
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-use std::env;
 use std::path;
 use std::process;
 use std::sync::mpsc::Sender;
 
-use chrono;
-
 use crate::intercept::{Error, Result, ResultExt, EventEnvelope};
 use crate::intercept::{Event, ExitCode, ProcessId};
+use super::protocol::sender::EventSink;
 use super::env::Vars;
 
 pub trait Executor {
@@ -33,7 +31,7 @@ pub trait Executor {
 }
 
 #[cfg(unix)]
-pub fn executor(reporter: Sender<EventEnvelope>) -> impl Executor {
+pub fn executor(reporter: impl EventSink) -> impl Executor {
     unix::UnixExecutor::new(reporter)
 }
 
@@ -53,22 +51,13 @@ mod unix {
 
     use super::*;
 
-    pub struct UnixExecutor {
-        reporter: Sender<EventEnvelope>,
+    pub struct UnixExecutor<T: EventSink> {
+        reporter: T,
     }
 
-    impl UnixExecutor {
-        pub fn new(reporter: Sender<EventEnvelope>) -> Self {
+    impl<T> UnixExecutor<T> where T: EventSink {
+        pub fn new(reporter: T) -> Self {
             UnixExecutor { reporter }
-        }
-
-        fn report(&self, id: ProcessId, event: Event) {
-            let envelope = EventEnvelope::new(id, event);
-
-            match self.reporter.send(envelope) {
-                Ok(_) => { debug!("report event: ok."); },
-                Err(error) => { info!("report event: failed. {}", error) },
-            }
         }
 
         fn spawn(&self, program: &std::path::Path, args: &[String], envs: &Vars) -> Result<nix::unistd::Pid>
@@ -77,7 +66,7 @@ mod unix {
                 .and_then(|pid| {
                     let id = pid.as_raw() as ProcessId;
                     let event = Event::created(program, args)?;
-                    self.report(id, event);
+                    self.reporter.report(id, event);
                     Ok(pid)
                 })
         }
@@ -89,22 +78,22 @@ mod unix {
             match wait::waitpid(pid, wait_flags()) {
                 Ok(wait::WaitStatus::Exited(_pid, code)) => {
                     let event = Event::TerminatedNormally { code };
-                    self.report(id, event);
+                    self.reporter.report(id, event);
                     Ok(code)
                 },
                 Ok(wait::WaitStatus::Signaled(_pid, signal, _dump)) => {
                     let event = Event::TerminatedAbnormally { signal: format!("{}", signal) };
-                    self.report(id, event);
+                    self.reporter.report(id, event);
                     Ok(127)
                 },
                 Ok(wait::WaitStatus::Stopped(_pid, signal)) => {
                     let event = Event::Stopped { signal: format!("{}", signal) };
-                    self.report(id, event);
+                    self.reporter.report(id, event);
                     Self::wait(self, pid)
                 },
                 Ok(wait::WaitStatus::Continued(_pid)) => {
                     let event = Event::Continued {};
-                    self.report(id, event);
+                    self.reporter.report(id, event);
                     Self::wait(self, pid)
                 },
                 Ok(_) => {
@@ -117,7 +106,7 @@ mod unix {
         }
     }
 
-    impl super::Executor for UnixExecutor {
+    impl<T> super::Executor for UnixExecutor<T> where T: EventSink {
         fn run(&self, program: &std::path::Path, args: &[String], envs: &Vars) -> Result<ExitCode> {
             let pid = self.spawn(program, args, envs)?;
             let exit_code = self.wait(pid)?;
@@ -233,6 +222,8 @@ mod unix {
     #[cfg(test)]
     mod test {
         use super::*;
+        use crate::intercept::inner::protocol::sender::EventSinkMock;
+
         use std::sync::mpsc;
         use crate::intercept::inner::env;
         use crate::intercept::report::Executable;
@@ -245,10 +236,10 @@ mod unix {
             use super::*;
 
             fn run_test(program: &str) -> Result<ExitCode> {
-                let (tx, _rx) = mpsc::channel();
+                let mock = EventSinkMock::new();
                 let cmd = Executable::WithPath(program.to_string()).resolve()?;
                 // run the command and return the exit code.
-                let sut = super::UnixExecutor::new(tx);
+                let sut = super::UnixExecutor::new(mock);
                 sut.run(
                     cmd.as_path(),
                     slice_of_strings!(program),
@@ -282,16 +273,21 @@ mod unix {
             use std::thread;
             use nix::sys::signal;
             use nix::unistd::Pid;
+            use mockiato;
 
             fn run_test(command: &std::path::Path, arguments: &[String]) -> Vec<EventEnvelope> {
-                let (tx, rx) = mpsc::channel();
-                {
-                    let sut = super::UnixExecutor::new(tx);
+                let mut results = vec!();
 
-                    let _ = sut.run(command, arguments, &env::Builder::new().build());
-                    drop(sut);
-                }
-                rx.iter().collect::<Vec<EventEnvelope>>()
+                let mock = EventSinkMock::new();
+                mock.expect_report(mockiato::Argument::any, |event| {
+                    let envelope = EventEnvelope::new(0, event);
+                    results.push(envelope);
+                });
+
+                let sut = super::UnixExecutor::new(mock);
+
+                let _ = sut.run(command, arguments, &env::Builder::new().build());
+                results
             }
 
             fn assert_start_stop_events(command: &std::path::Path, arguments: &[String], expected_exit_code: i32) {
